@@ -198,18 +198,18 @@ void render_led() {
   bool lost = paired && (now - last_peer_seen > kPeerTimeoutMs);
   bool blink = lost ? ((now / 120) % 2 == 0) : (!paired && ((now / 600) % 2 == 0));
   bool pulse = now < led_pulse_until;
-  uint8_t red = 2, green = 2;
+  uint8_t red = 8, green = 8;
   if (paired) {
-    if (mac_less(local_mac, peer_mac)) green = 24;
-    else red = 24;
+    if (mac_less(local_mac, peer_mac)) green = 64;
+    else red = 64;
   } else {
-    red = green = 4;
+    red = green = 12;
   }
   if (blink) red = green = 0;
   if (pulse) {
-    if (mac_less(local_mac, peer_mac)) green = 80;
-    else if (paired) red = 80;
-    else red = green = 32;
+    if (mac_less(local_mac, peer_mac)) green = 160;
+    else if (paired) red = 160;
+    else red = green = 96;
   }
   rgb.setPixelColor(0, rgb.Color(red, green, 0));
   rgb.show();
@@ -518,7 +518,7 @@ void setup_radio() {
 void setup_impl() {
   pinMode(kButtonPin, INPUT_PULLUP);
   rgb.begin();
-  rgb.setBrightness(32);
+  rgb.setBrightness(64);
   rgb.clear();
   rgb.show();
   preferences.begin("midi-bridge", false);
