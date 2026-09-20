@@ -38,6 +38,7 @@ global PlatformIO home.
 ```sh
 ./build.sh
 python3 -m unittest discover -s tests -p 'test_*.py'
+./tests/run_cpp_tests.sh
 ```
 
 The generated image is `.pio/build/atoms3-lite/firmware.bin`. Both boards
@@ -52,8 +53,8 @@ shasum -a 256 .pio/build/atoms3-lite/firmware.bin
 
 `flash.sh` performs a normal PlatformIO upload only. Put an Atom into ROM
 download mode first using the reset procedure above. No hardware was attached
-during repository verification, so enumeration and radio operation remain
-hardware-pending.
+during this reliability-hardening build, so the changes below remain pending
+hardware regression testing.
 
 ## Pairing and operation
 
@@ -71,13 +72,41 @@ does not authenticate or encrypt ESP-NOW payloads; pairing is therefore
 convenience pairing, not a security boundary.
 
 USB input packets are queued locally and sent one USB-MIDI event packet per
-radio frame. Remote event packets are delivered to the USB MIDI input endpoint
-without being re-forwarded, preventing internal echo loops. Realtime CIN 0xF
-events are serviced ahead of normal traffic. SysEx is transported as the
-ordered sequence of USB-MIDI event packets, with bounded 250-byte radio frames,
-bounded queues, a 65,535-byte reassembly ceiling in the reference tooling and
-a one-second incomplete-stream timeout in the firmware design. Sequence gaps,
-duplicates, malformed packets and queue drops are counted internally.
+radio frame. A fixed FreeRTOS queue carries complete received radio frames,
+including their source MAC, from the ESP-NOW callback to the main loop. Remote
+event packets are delivered to the USB MIDI input endpoint without being
+re-forwarded, preventing internal echo loops. A remote USB event remains at the
+head of its queue until `tud_midi_packet_write()` accepts it; a busy endpoint
+therefore causes bounded retry rather than loss.
+
+At most one MIDI unicast is in flight. The event is removed from the local
+queue only after `esp_now_send()` accepts the frame. Immediate submission
+errors retain the event for up to three short retries; an asynchronous delivery
+failure is not blindly retried because the MAC acknowledgement is ambiguous for
+Note On duplication. Realtime CIN 0xF events are prioritized, with one normal
+event admitted after at most four realtime sends so normal traffic cannot be
+permanently starved. All queues are bounded and drops, USB busy results,
+immediate radio errors, asynchronous radio errors, accepted sends, retries and
+foreign-source packets are counted in firmware diagnostics.
+
+After pairing, only frames whose source MAC equals the stored peer are accepted.
+Unpaired discovery validates that the payload MAC matches the actual radio
+source. Discovery and MIDI packets share the same bounded send gate, so a
+discovery callback cannot corrupt MIDI transmit state.
+
+SysEx is transported as the ordered sequence of USB-MIDI event packets, with
+bounded 250-byte radio frames, bounded queues, a 65,535-byte reassembly ceiling
+in the reference tooling and a one-second incomplete-stream timeout in the
+firmware design. Sequence gaps, duplicates, malformed packets and queue drops
+are counted internally.
+
+When a paired peer times out, the bridge queues one local panic: CC 123 All
+Notes Off and CC 120 All Sound Off on all 16 channels. The same local-only
+panic is queued once when a returning peer advertises a new session ID. A short
+button press queues the same 32 messages locally and for radio forwarding; it
+does not write directly to USB or radio. A long press removes the stored
+unicast peer, resets session/sequence/in-flight state, flushes queues, and
+returns to discovery without blocking LED animation.
 
 Wire header, in network byte order, is:
 
@@ -94,12 +123,21 @@ Wire header, in network byte order, is:
 
 The payload is either discovery identity/session data or one four-byte
 `midiEventPacket_t` preserving its USB-MIDI header/CIN and three MIDI bytes.
-ESP-NOW send callbacks only update counters; USB and protocol work runs in the
-main loop, so callbacks do not block on USB or acknowledgements.
+ESP-NOW callbacks only copy fixed-size frames to the FreeRTOS receive queue or
+publish a small transmit completion state; USB, Preferences and protocol work
+runs in the main loop. No callback allocates memory, writes USB, or waits for a
+radio acknowledgement.
 
 ## Hardware test plan
 
-These tests are planned, not passed:
+Previously hardware-observed:
+
+- both AtomS3 Lite boards enumerate as `ESP-NOW MIDI Bridge`;
+- the two-node pairing fix was observed to make the opposite activity LED
+  flash when MIDI was sent from Pure Data.
+
+The reliability changes in this revision still require the following physical
+regression tests:
 
 1. Flash the identical image to two boards; confirm both enumerate as
    `ESP-NOW MIDI Bridge` with a class-compliant MIDI interface.
@@ -109,8 +147,15 @@ These tests are planned, not passed:
 3. Reboot either peer during traffic; verify rediscovery, no duplicate Note On,
    and panic recovery after interference. Test long-press reset and re-pair.
 4. Measure MIDI clock jitter and one-way/round-trip latency with a GPIO toggle
-   or timestamped MIDI test generator. The design target is approximately
-   1–3 ms practical bridge latency; it is not a measured result.
+  or timestamped MIDI test generator. The design target is approximately
+  1–3 ms practical bridge latency; it is not a measured result.
+
+For dense-traffic testing, send a sustained CC stream while interleaving MIDI
+clock and start/stop, unplug one USB host briefly, reboot one Atom, and send a
+long SysEx. Confirm that realtime traffic continues, no stuck notes remain after
+the timeout panic, no duplicate Note On is heard after recovery, and the two
+devices can be long-press reset and paired again without changing the firmware
+image.
 
 For troubleshooting, first check that both boards are in download mode during
 flashing, that both use the same image hash, that neither is joined to another

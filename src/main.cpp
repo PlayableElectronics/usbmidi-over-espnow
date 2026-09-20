@@ -3,12 +3,14 @@
 #include <Preferences.h>
 #include <USB.h>
 #include "esp32-hal-tinyusb.h"
+#include "bridge_policy.h"
 #include "tusb.h"
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 
 #include <array>
+#include <atomic>
 #include <cstring>
 
 namespace {
@@ -28,6 +30,8 @@ constexpr uint32_t kPeerTimeoutMs = 2500;
 constexpr uint32_t kLongPressMs = 1500;
 constexpr uint32_t kSysexTimeoutMs = 1000;
 constexpr uint32_t kMaxSysexBytes = 65535;
+constexpr uint32_t kTxRetryDelayMs = 2;
+constexpr uint8_t kMaxImmediateRetries = 3;
 
 enum MessageType : uint8_t { MSG_DISCOVERY = 1, MSG_DISCOVERY_ACK = 2, MSG_MIDI = 3 };
 
@@ -39,23 +43,29 @@ struct MidiEvent {
     uint8_t byte3 = 0;
   } packet;
   uint32_t received_at = 0;
+  bool forward = true;
 };
 
 struct RadioFrame {
   uint8_t data[kRadioLimit]{};
   size_t length = 0;
+  uint8_t source_mac[6]{};
 };
 
 struct Counters {
-  uint32_t sent = 0;
-  uint32_t received = 0;
-  uint32_t send_failed = 0;
-  uint32_t duplicate = 0;
-  uint32_t malformed = 0;
-  uint32_t sequence_gaps = 0;
-  uint32_t queue_drops = 0;
-  uint32_t usb_in = 0;
-  uint32_t usb_out = 0;
+  std::atomic<uint32_t> received{0};
+  std::atomic<uint32_t> duplicate{0};
+  std::atomic<uint32_t> malformed{0};
+  std::atomic<uint32_t> sequence_gaps{0};
+  std::atomic<uint32_t> queue_drops{0};
+  std::atomic<uint32_t> usb_in{0};
+  std::atomic<uint32_t> usb_out{0};
+  std::atomic<uint32_t> radio_accepted{0};
+  std::atomic<uint32_t> radio_immediate_failures{0};
+  std::atomic<uint32_t> radio_async_failures{0};
+  std::atomic<uint32_t> radio_retries{0};
+  std::atomic<uint32_t> usb_busy{0};
+  std::atomic<uint32_t> foreign_packets{0};
 };
 
 uint16_t midi_descriptor(uint8_t *dst, uint8_t *itf) {
@@ -101,9 +111,9 @@ Adafruit_NeoPixel rgb(1, kRgbPin, NEO_GRB + NEO_KHZ800);
 Preferences preferences;
 Counters counters;
 
-std::array<RadioFrame, kRadioQueueDepth> radio_queue{};
-volatile size_t radio_head = 0;
-volatile size_t radio_tail = 0;
+StaticQueue_t radio_queue_storage;
+uint8_t radio_queue_storage_buffer[kRadioQueueDepth * sizeof(RadioFrame)] __attribute__((aligned(4)));
+QueueHandle_t radio_queue_handle = nullptr;
 std::array<MidiEvent, kUsbQueueDepth> remote_realtime_queue{};
 size_t remote_realtime_head = 0;
 size_t remote_realtime_tail = 0;
@@ -133,6 +143,24 @@ bool button_was_down = false;
 bool sysex_active = false;
 uint32_t sysex_last_at = 0;
 uint32_t sysex_bytes = 0;
+bool peer_timed_out = false;
+bool timeout_panic_sent = false;
+uint32_t last_panic_session = 0;
+uint32_t pairing_reset_until = 0;
+
+enum class TxResult : uint8_t { None, Success, Failure };
+enum class TxKind : uint8_t { None, Midi, Discovery };
+portMUX_TYPE tx_mux = portMUX_INITIALIZER_UNLOCKED;
+volatile TxResult tx_result = TxResult::None;
+volatile TxKind tx_kind = TxKind::None;
+bool tx_in_flight = false;
+uint8_t tx_immediate_retries = 0;
+uint32_t tx_retry_after = 0;
+uint8_t consecutive_realtime_sends = 0;
+
+bool deadline_active(uint32_t now, uint32_t deadline) {
+  return static_cast<int32_t>(deadline - now) > 0;
+}
 
 uint32_t read_u32(const uint8_t *p) {
   return (static_cast<uint32_t>(p[0]) << 24) |
@@ -147,35 +175,37 @@ void write_u32(uint8_t *p, uint32_t v) {
   p[3] = static_cast<uint8_t>(v);
 }
 
-bool mac_equal(const uint8_t *a, const uint8_t *b) { return std::memcmp(a, b, 6) == 0; }
+bool mac_equal(const uint8_t *a, const uint8_t *b) { return bridge_mac_equal(a, b); }
 
 bool mac_less(const uint8_t *a, const uint8_t *b) {
   return std::memcmp(a, b, 6) < 0;
 }
 
-bool queue_radio(const uint8_t *data, size_t length) {
-  if (length > kRadioLimit || ((radio_head + 1) % kRadioQueueDepth) == radio_tail) {
+bool queue_radio(const uint8_t *source_mac, const uint8_t *data, size_t length) {
+  if (length > kRadioLimit || !radio_queue_handle) {
     counters.queue_drops++;
     return false;
   }
-  std::memcpy(radio_queue[radio_head].data, data, length);
-  radio_queue[radio_head].length = length;
-  radio_head = (radio_head + 1) % kRadioQueueDepth;
+  RadioFrame frame{};
+  std::memcpy(frame.source_mac, source_mac, sizeof(frame.source_mac));
+  std::memcpy(frame.data, data, length);
+  frame.length = length;
+  if (xQueueSend(radio_queue_handle, &frame, 0) != pdTRUE) {
+    counters.queue_drops++;
+    return false;
+  }
   return true;
 }
 
 bool pop_radio(RadioFrame &frame) {
-  if (radio_tail == radio_head) return false;
-  frame = radio_queue[radio_tail];
-  radio_tail = (radio_tail + 1) % kRadioQueueDepth;
-  return true;
+  return radio_queue_handle && xQueueReceive(radio_queue_handle, &frame, 0) == pdTRUE;
 }
 
 template <size_t N>
 bool queue_midi(std::array<MidiEvent, N> &queue, size_t &head, size_t tail,
                 const MidiEvent &event) {
   size_t next = (head + 1) % N;
-  if (next == tail) {
+  if (bridge_queue_full<N>(head, tail)) {
     counters.queue_drops++;
     return false;
   }
@@ -193,26 +223,41 @@ bool pop_midi(std::array<MidiEvent, N> &queue, size_t tail, size_t head,
   return true;
 }
 
+template <size_t N>
+bool peek_midi(const std::array<MidiEvent, N> &queue, size_t tail, size_t head,
+              MidiEvent &event) {
+  if (tail == head) return false;
+  event = queue[tail];
+  return true;
+}
+
+template <size_t N>
+bool drop_midi(const std::array<MidiEvent, N> &queue, size_t tail, size_t head,
+              size_t &new_tail) {
+  (void)queue;
+  (void)head;
+  if (tail == head) return false;
+  new_tail = (tail + 1) % N;
+  return true;
+}
+
 void pulse_led() { led_pulse_until = millis() + 30; }
 
 void render_led() {
   uint32_t now = millis();
   bool lost = paired && (now - last_peer_seen > kPeerTimeoutMs);
   bool blink = lost ? ((now / 120) % 2 == 0) : (!paired && ((now / 600) % 2 == 0));
-  bool pulse = now < led_pulse_until;
-  uint8_t red = 8, green = 8;
+  bool pulse = deadline_active(now, led_pulse_until);
+  uint8_t red = 0, green = 0;
   if (paired) {
-    if (mac_less(local_mac, peer_mac)) green = 64;
-    else red = 64;
+    if (mac_less(local_mac, peer_mac)) green = pulse ? 160 : 64;
+    else red = pulse ? 160 : 64;
   } else {
     red = green = 12;
+    if (pulse) red = green = 96;
   }
   if (blink) red = green = 0;
-  if (pulse) {
-    if (mac_less(local_mac, peer_mac)) green = 160;
-    else if (paired) red = 160;
-    else red = green = 96;
-  }
+  if (deadline_active(now, pairing_reset_until) && ((now / 80) % 2 == 0)) red = green = 64;
   rgb.setPixelColor(0, rgb.Color(red, green, 0));
   rgb.show();
 }
@@ -232,9 +277,29 @@ void save_peer() {
 }
 
 void clear_peer() {
+  if (paired && esp_now_is_peer_exist(peer_mac)) esp_now_del_peer(peer_mac);
   preferences.clear();
   paired = false;
   have_peer_sequence = false;
+  peer_session = 0;
+  last_peer_sequence = 0;
+  last_peer_seen = 0;
+  peer_timed_out = false;
+  timeout_panic_sent = false;
+  last_panic_session = 0;
+  portENTER_CRITICAL(&tx_mux);
+  tx_in_flight = false;
+  tx_result = TxResult::None;
+  tx_kind = TxKind::None;
+  portEXIT_CRITICAL(&tx_mux);
+  tx_immediate_retries = 0;
+  tx_retry_after = 0;
+  consecutive_realtime_sends = 0;
+  local_realtime_head = local_realtime_tail = 0;
+  local_normal_head = local_normal_tail = 0;
+  remote_realtime_head = remote_realtime_tail = 0;
+  remote_normal_head = remote_normal_tail = 0;
+  if (radio_queue_handle) xQueueReset(radio_queue_handle);
   std::memset(peer_mac, 0, sizeof(peer_mac));
 }
 
@@ -255,40 +320,30 @@ bool build_packet(uint8_t type, const uint8_t *payload, size_t payload_length,
   return true;
 }
 
-bool send_raw(const uint8_t *destination, const uint8_t *data, size_t length) {
-  if (!destination || length > kRadioLimit) return false;
-  return esp_now_send(destination, data, length) == ESP_OK;
-}
-
-bool send_packet(uint8_t type, const uint8_t *payload, size_t payload_length,
-                 const uint8_t *destination = nullptr) {
-  if (!paired && type == MSG_MIDI) return false;
-  uint8_t packet[kRadioLimit]{};
-  size_t length = 0;
-  if (!build_packet(type, payload, payload_length, packet, length)) return false;
-  if (destination) return send_raw(destination, packet, length);
-  if (!paired) return false;
-  return send_raw(peer_mac, packet, length);
-}
-
 void send_discovery(uint8_t type = MSG_DISCOVERY, const uint8_t *destination = nullptr) {
+  if (tx_in_flight) return;
   uint8_t payload[10]{};
   std::memcpy(payload, local_mac, 6);
   write_u32(payload + 6, session_id);
   uint8_t packet[kRadioLimit]{};
   size_t length = 0;
   if (!build_packet(type, payload, sizeof(payload), packet, length)) return;
-  if (destination) send_raw(destination, packet, length);
-  else esp_now_send(kBroadcastMac, packet, length);
+  const uint8_t *target = destination ? destination : kBroadcastMac;
+  portENTER_CRITICAL(&tx_mux);
+  tx_result = TxResult::None;
+  tx_kind = TxKind::Discovery;
+  tx_in_flight = true;
+  portEXIT_CRITICAL(&tx_mux);
+  if (esp_now_send(target, packet, length) != ESP_OK) {
+    portENTER_CRITICAL(&tx_mux);
+    tx_in_flight = false;
+    tx_kind = TxKind::None;
+    portEXIT_CRITICAL(&tx_mux);
+    counters.radio_immediate_failures++;
+  }
 }
 
-void send_midi_event(const MidiEvent &event) {
-  uint8_t payload[4] = {event.packet.header, event.packet.byte1, event.packet.byte2,
-                        event.packet.byte3};
-  send_packet(MSG_MIDI, payload, sizeof(payload));
-}
-
-void send_panic() {
+void queue_panic(bool forward) {
   for (uint8_t channel = 0; channel < 16; ++channel) {
     for (uint8_t controller : {static_cast<uint8_t>(123), static_cast<uint8_t>(120)}) {
       MidiEvent event{};
@@ -296,34 +351,42 @@ void send_panic() {
       event.packet.byte1 = static_cast<uint8_t>(0xB0 | channel);
       event.packet.byte2 = controller;
       event.packet.byte3 = 0;
-      MIDI.writePacket(&event.packet);
-      send_midi_event(event);
+      event.forward = forward;
+      // Always deliver the panic to the locally attached USB host. Only the
+      // manual form is also placed on the outbound radio queue.
+      queue_midi(remote_normal_queue, remote_normal_head, remote_normal_tail, event);
+      if (forward) queue_midi(local_normal_queue, local_normal_head, local_normal_tail, event);
     }
   }
   pulse_led();
 }
 
 void on_send(const uint8_t *, esp_now_send_status_t status) {
-  if (status == ESP_NOW_SEND_SUCCESS) counters.sent++;
-  else counters.send_failed++;
+  portENTER_CRITICAL(&tx_mux);
+  if (tx_in_flight) tx_result = status == ESP_NOW_SEND_SUCCESS ? TxResult::Success : TxResult::Failure;
+  portEXIT_CRITICAL(&tx_mux);
 }
 
-void on_receive(const uint8_t *, const uint8_t *data, int length) {
-  if (length <= 0 || length > static_cast<int>(kRadioLimit)) {
+void on_receive(const uint8_t *source_mac, const uint8_t *data, int length) {
+  if (!source_mac || !data || length <= 0 || length > static_cast<int>(kRadioLimit)) {
     counters.malformed++;
     return;
   }
-  queue_radio(data, static_cast<size_t>(length));
+  queue_radio(source_mac, data, static_cast<size_t>(length));
 }
 
 bool newer_sequence(uint32_t candidate, uint32_t previous) {
-  return static_cast<int32_t>(candidate - previous) > 0;
+  return bridge_sequence_is_newer(candidate, previous);
 }
 
-void handle_discovery(uint8_t type, uint32_t session, const uint8_t *payload,
-                     size_t payload_length) {
+void handle_discovery(const uint8_t *source_mac, uint8_t type, uint32_t session,
+                      const uint8_t *payload, size_t payload_length) {
   if (payload_length != 10 || read_u32(payload + 6) != session || mac_equal(payload, local_mac)) {
     counters.malformed++;
+    return;
+  }
+  if (!mac_equal(source_mac, payload)) {
+    counters.foreign_packets++;
     return;
   }
   if (paired && !mac_equal(payload, peer_mac)) return;
@@ -333,7 +396,14 @@ void handle_discovery(uint8_t type, uint32_t session, const uint8_t *payload,
     paired = true;
     save_peer();
   }
+  if (peer_session != 0 && peer_session != session && last_panic_session != session) {
+    queue_panic(false);
+    last_panic_session = session;
+  }
+  peer_session = session;
   last_peer_seen = millis();
+  if (peer_timed_out) timeout_panic_sent = false;
+  peer_timed_out = false;
   have_peer_sequence = false;
   if (type == MSG_DISCOVERY) send_discovery(MSG_DISCOVERY_ACK, peer_mac);
   pulse_led();
@@ -403,8 +473,12 @@ void process_radio() {
       counters.malformed++;
       continue;
     }
+    if (!bridge_source_allowed(paired, frame.source_mac, peer_mac)) {
+      counters.foreign_packets++;
+      continue;
+    }
     if (type == MSG_DISCOVERY || type == MSG_DISCOVERY_ACK) {
-      handle_discovery(type, session, frame.data + kHeaderSize, payload_length);
+      handle_discovery(frame.source_mac, type, session, frame.data + kHeaderSize, payload_length);
       continue;
     }
     if (type != MSG_MIDI || !paired) {
@@ -412,9 +486,15 @@ void process_radio() {
       continue;
     }
     last_peer_seen = millis();
+    if (peer_timed_out) timeout_panic_sent = false;
+    peer_timed_out = false;
     if (session != peer_session) {
       peer_session = session;
       have_peer_sequence = false;
+      if (session != 0 && last_panic_session != session) {
+        queue_panic(false);
+        last_panic_session = session;
+      }
     }
     if (have_peer_sequence) {
       if (!newer_sequence(sequence, last_peer_sequence)) {
@@ -447,27 +527,114 @@ void process_usb_input() {
 void process_usb_output() {
   MidiEvent event;
   for (uint8_t i = 0; i < 8; ++i) {
-    if (!pop_midi(remote_realtime_queue, remote_realtime_tail, remote_realtime_head,
-                 remote_realtime_tail, event)) break;
-    MIDI.writePacket(&event.packet);
+    if (!peek_midi(remote_realtime_queue, remote_realtime_tail, remote_realtime_head, event)) break;
+    if (!bridge_usb_write_commit(MIDI.writePacket(&event.packet))) {
+      counters.usb_busy++;
+      break;
+    }
+    drop_midi(remote_realtime_queue, remote_realtime_tail, remote_realtime_head,
+              remote_realtime_tail);
     counters.usb_out++;
   }
   for (uint8_t i = 0; i < 8; ++i) {
-    if (!pop_midi(remote_normal_queue, remote_normal_tail, remote_normal_head,
-                 remote_normal_tail, event)) break;
-    MIDI.writePacket(&event.packet);
+    if (!peek_midi(remote_normal_queue, remote_normal_tail, remote_normal_head, event)) break;
+    if (!bridge_usb_write_commit(MIDI.writePacket(&event.packet))) {
+      counters.usb_busy++;
+      break;
+    }
+    drop_midi(remote_normal_queue, remote_normal_tail, remote_normal_head,
+              remote_normal_tail);
     counters.usb_out++;
   }
 }
 
-void process_local_radio() {
-  MidiEvent event;
-  for (uint8_t i = 0; i < 8; ++i) {
-    if (pop_midi(local_realtime_queue, local_realtime_tail, local_realtime_head,
-                 local_realtime_tail, event)) send_midi_event(event);
+void process_radio_tx() {
+  TxResult result;
+  TxKind kind;
+  portENTER_CRITICAL(&tx_mux);
+  result = tx_result;
+  kind = tx_kind;
+  if (result != TxResult::None) tx_result = TxResult::None;
+  if (result != TxResult::None) tx_kind = TxKind::None;
+  portEXIT_CRITICAL(&tx_mux);
+  if (tx_in_flight && result != TxResult::None) {
+    tx_in_flight = false;
+    if (kind == TxKind::Discovery) {
+      if (result == TxResult::Failure) counters.radio_async_failures++;
+      return;
+    }
+    if (result == TxResult::Success) {
+      counters.radio_accepted++;
+      tx_immediate_retries = 0;
+      tx_retry_after = 0;
+    } else {
+      counters.radio_async_failures++;
+      tx_retry_after = millis() + kTxRetryDelayMs;
+      tx_immediate_retries = kMaxImmediateRetries;
+      // The frame was accepted by the radio, so retrying could duplicate a note.
+    }
   }
-  if (pop_midi(local_normal_queue, local_normal_tail, local_normal_head,
-               local_normal_tail, event)) send_midi_event(event);
+  if (!paired || tx_in_flight || deadline_active(millis(), tx_retry_after)) return;
+
+  MidiEvent event;
+  bool have_normal = peek_midi(local_normal_queue, local_normal_tail, local_normal_head, event);
+  bool use_realtime = bridge_use_realtime(
+      consecutive_realtime_sends,
+      peek_midi(local_realtime_queue, local_realtime_tail, local_realtime_head, event),
+      have_normal);
+  if (!use_realtime && !have_normal) {
+    if (!peek_midi(local_realtime_queue, local_realtime_tail, local_realtime_head, event)) return;
+    use_realtime = true;
+  } else if (!use_realtime) {
+    peek_midi(local_normal_queue, local_normal_tail, local_normal_head, event);
+  }
+  if (!event.forward) {
+    if (use_realtime) drop_midi(local_realtime_queue, local_realtime_tail, local_realtime_head,
+                             local_realtime_tail);
+    else drop_midi(local_normal_queue, local_normal_tail, local_normal_head, local_normal_tail);
+    return;
+  }
+
+  uint8_t payload[4] = {event.packet.header, event.packet.byte1, event.packet.byte2,
+                        event.packet.byte3};
+  uint8_t packet[kRadioLimit]{};
+  size_t length = 0;
+  if (!build_packet(MSG_MIDI, payload, sizeof(payload), packet, length)) return;
+  portENTER_CRITICAL(&tx_mux);
+  tx_result = TxResult::None;
+  tx_in_flight = true;
+  portEXIT_CRITICAL(&tx_mux);
+  esp_err_t status = esp_now_send(peer_mac, packet, length);
+  if (status == ESP_OK) {
+    if (use_realtime) drop_midi(local_realtime_queue, local_realtime_tail, local_realtime_head,
+                             local_realtime_tail);
+    else drop_midi(local_normal_queue, local_normal_tail, local_normal_head, local_normal_tail);
+    tx_immediate_retries = 0;
+  } else {
+    portENTER_CRITICAL(&tx_mux);
+    tx_in_flight = false;
+    portEXIT_CRITICAL(&tx_mux);
+    counters.radio_immediate_failures++;
+    if (tx_immediate_retries < kMaxImmediateRetries) {
+      tx_immediate_retries++;
+      counters.radio_retries++;
+      tx_retry_after = millis() + kTxRetryDelayMs;
+    } else {
+      if (use_realtime) drop_midi(local_realtime_queue, local_realtime_tail, local_realtime_head,
+                               local_realtime_tail);
+      else drop_midi(local_normal_queue, local_normal_tail, local_normal_head, local_normal_tail);
+      counters.queue_drops++;
+      tx_immediate_retries = 0;
+    }
+  }
+  if (status == ESP_OK) {
+    if (use_realtime) consecutive_realtime_sends++;
+    else consecutive_realtime_sends = 0;
+  }
+}
+
+void process_local_radio() {
+  process_radio_tx();
 }
 
 void handle_button() {
@@ -478,19 +645,24 @@ void handle_button() {
     uint32_t held = now - button_down_at;
     if (held >= kLongPressMs) {
       clear_peer();
-      for (uint8_t i = 0; i < 3; ++i) {
-        rgb.setPixelColor(0, rgb.Color(40, 40, 40));
-        rgb.show();
-        delay(80);
-        rgb.clear();
-        rgb.show();
-        delay(80);
-      }
+      pairing_reset_until = millis() + 600;
     } else {
-      send_panic();
+      queue_panic(true);
     }
   }
   button_was_down = down;
+}
+
+void handle_connection_timeout() {
+  if (!paired) return;
+  bool timed_out = millis() - last_peer_seen > kPeerTimeoutMs;
+  if (timed_out && !peer_timed_out) {
+    peer_timed_out = true;
+    if (!timeout_panic_sent) {
+      queue_panic(false);
+      timeout_panic_sent = true;
+    }
+  }
 }
 
 void setup_radio() {
@@ -507,6 +679,11 @@ void setup_radio() {
       rgb.show();
       delay(250);
     }
+  }
+  radio_queue_handle = xQueueCreateStatic(kRadioQueueDepth, sizeof(RadioFrame),
+                                          radio_queue_storage_buffer, &radio_queue_storage);
+  if (!radio_queue_handle) {
+    while (true) delay(1000);
   }
   add_peer(kBroadcastMac);
   esp_now_register_send_cb(on_send);
@@ -528,7 +705,6 @@ void setup_impl() {
   session_id = esp_random();
   setup_radio();
   MIDI.begin();
-  USB.begin();
 }
 
 void loop_impl() {
@@ -537,6 +713,7 @@ void loop_impl() {
   process_usb_output();
   process_local_radio();
   handle_button();
+  handle_connection_timeout();
   uint32_t now = millis();
   if (now - last_discovery >= kDiscoveryPeriodMs &&
       (!paired || now - last_peer_seen > kPeerTimeoutMs)) {

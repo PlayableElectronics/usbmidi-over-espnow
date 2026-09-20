@@ -54,6 +54,19 @@ class ProtocolTests(unittest.TestCase):
             reassembler.add(b"12345")
         self.assertIsNone(reassembler.add(b"\xf0"))
 
+    def test_sysex_chunks_can_be_interleaved_with_realtime_events(self):
+        message = b"\xf0" + bytes(range(40)) + b"\xf7"
+        chunks = fragment_sysex(message, 8)
+        reassembler = SysexReassembler()
+        result = None
+        for index, chunk in enumerate(chunks):
+            if index == 2:
+                # MIDI realtime packets are separate USB-MIDI events and do
+                # not enter the SysEx reassembly stream.
+                self.assertIsNone(reassembler.add(b""))
+            result = reassembler.add(chunk)
+        self.assertEqual(result, message)
+
 
 if __name__ == "__main__":
     unittest.main()
