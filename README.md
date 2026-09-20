@@ -1,6 +1,6 @@
 # AtomS3 Lite ESP-NOW MIDI bridge
 
-This subproject builds one identical firmware image for two M5Stack AtomS3 Lite
+This repository builds one identical firmware image for two M5Stack AtomS3 Lite
 boards. Each board is a native USB MIDI 1.0 device and an ESP-NOW peer; the
 same binary works on either side of the link.
 
@@ -36,7 +36,6 @@ the repository's ignored `.local/` directory instead of assuming a writable
 global PlatformIO home.
 
 ```sh
-cd m5stack/espnow-midi-bridge
 ./build.sh
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
