@@ -17,6 +17,7 @@ constexpr uint8_t kRgbPin = 35;
 constexpr uint8_t kWifiChannel = 6;
 constexpr uint8_t kProtocolVersion = 1;
 constexpr uint8_t kMagic[4] = {'E', 'N', 'M', '1'};
+constexpr uint8_t kBroadcastMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 constexpr size_t kHeaderSize = 18;
 constexpr size_t kRadioLimit = ESP_NOW_MAX_DATA_LEN;
 constexpr size_t kMaxPayload = kRadioLimit - kHeaderSize;
@@ -278,7 +279,7 @@ void send_discovery(uint8_t type = MSG_DISCOVERY, const uint8_t *destination = n
   size_t length = 0;
   if (!build_packet(type, payload, sizeof(payload), packet, length)) return;
   if (destination) send_raw(destination, packet, length);
-  else esp_now_send(nullptr, packet, length);
+  else esp_now_send(kBroadcastMac, packet, length);
 }
 
 void send_midi_event(const MidiEvent &event) {
@@ -507,6 +508,7 @@ void setup_radio() {
       delay(250);
     }
   }
+  add_peer(kBroadcastMac);
   esp_now_register_send_cb(on_send);
   esp_now_register_recv_cb(on_receive);
   size_t length = preferences.getBytesLength("peer");
