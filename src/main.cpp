@@ -59,8 +59,8 @@ struct Counters {
 
 uint16_t midi_descriptor(uint8_t *dst, uint8_t *itf) {
   uint8_t str_index = tinyusb_add_string_descriptor("ESP-NOW MIDI Bridge");
-  uint8_t ep_out = tinyusb_get_free_out_endpoint();
   uint8_t ep_in = tinyusb_get_free_in_endpoint();
+  uint8_t ep_out = tinyusb_get_free_out_endpoint();
   if (ep_out == 0 || ep_in == 0) return 0;
   uint8_t descriptor[TUD_MIDI_DESC_LEN] = {
       TUD_MIDI_DESCRIPTOR(*itf, str_index, ep_out, static_cast<uint8_t>(0x80 | ep_in), 64)};
