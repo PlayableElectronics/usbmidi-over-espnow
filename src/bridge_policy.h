@@ -32,6 +32,10 @@ inline bool bridge_usb_write_commit(bool write_accepted) {
   return write_accepted;
 }
 
+inline void bridge_async_failure_reset(uint8_t &immediate_retries) {
+  immediate_retries = 0;
+}
+
 enum class BridgeTxDecision : uint8_t { Idle, Accepted, ImmediateRetry, Drop };
 
 class BridgeTxPolicy {
@@ -53,6 +57,8 @@ class BridgeTxPolicy {
   }
 
   uint8_t retries() const { return retries_; }
+
+  void asynchronous_failure() { retries_ = 0; }
 
  private:
   uint8_t max_retries_;

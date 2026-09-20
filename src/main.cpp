@@ -569,8 +569,8 @@ void process_radio_tx() {
       tx_retry_after = 0;
     } else {
       counters.radio_async_failures++;
-      tx_retry_after = millis() + kTxRetryDelayMs;
-      tx_immediate_retries = kMaxImmediateRetries;
+      tx_retry_after = 0;
+      bridge_async_failure_reset(tx_immediate_retries);
       // The frame was accepted by the radio, so retrying could duplicate a note.
     }
   }
@@ -602,6 +602,7 @@ void process_radio_tx() {
   if (!build_packet(MSG_MIDI, payload, sizeof(payload), packet, length)) return;
   portENTER_CRITICAL(&tx_mux);
   tx_result = TxResult::None;
+  tx_kind = TxKind::Midi;
   tx_in_flight = true;
   portEXIT_CRITICAL(&tx_mux);
   esp_err_t status = esp_now_send(peer_mac, packet, length);

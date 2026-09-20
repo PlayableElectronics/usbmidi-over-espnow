@@ -25,6 +25,21 @@ int main() {
   assert(tx.try_accept(false, false) == BridgeTxDecision::Drop);
   assert(tx.try_accept(false, true) == BridgeTxDecision::Accepted);
   assert(tx.try_accept(true, true) == BridgeTxDecision::Idle);
+  uint8_t retries = 3;
+  bridge_async_failure_reset(retries);
+  assert(retries == 0);
+  BridgeTxPolicy next_event(3);
+  assert(next_event.try_accept(false, false) == BridgeTxDecision::ImmediateRetry);
+  assert(next_event.try_accept(false, false) == BridgeTxDecision::ImmediateRetry);
+  assert(next_event.try_accept(false, false) == BridgeTxDecision::ImmediateRetry);
+  assert(next_event.try_accept(false, false) == BridgeTxDecision::Drop);
+  BridgeTxPolicy after_async(3);
+  assert(after_async.try_accept(false, false) == BridgeTxDecision::ImmediateRetry);
+  after_async.asynchronous_failure();
+  assert(after_async.try_accept(false, false) == BridgeTxDecision::ImmediateRetry);
+  assert(after_async.try_accept(false, false) == BridgeTxDecision::ImmediateRetry);
+  assert(after_async.try_accept(false, false) == BridgeTxDecision::ImmediateRetry);
+  assert(after_async.try_accept(false, false) == BridgeTxDecision::Drop);
 
   BridgePanicPolicy panic;
   assert(panic.timeout_transition(true, true));
