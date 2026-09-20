@@ -119,6 +119,20 @@ Wi-Fi network, and that both are on channel 6. A third nearby bridge can still
 be selected after a forget operation because the first compatible discovery is
 accepted; reset and pair the intended two units in isolation when possible.
 
+On macOS, the two bridge devices can be tested without NerdSEQ using the
+tracked CoreMIDI loopback utility:
+
+```sh
+clang -framework CoreFoundation -framework CoreMIDI \
+  tools/macos_midi_loopback_test.c -o /tmp/espnow-midi-loopback-test
+/tmp/espnow-midi-loopback-test --test
+```
+
+It sends one note-on, MIDI clock and note-off to each destination in turn,
+waits 350 ms, and requires the opposite Atom's source to receive the traffic.
+It is a one-shot test and does not transmit anything if exactly two bridge MIDI
+sources and destinations are not present.
+
 ## License
 
 The bridge source in this directory is MIT-licensed; see `LICENSE`.
